@@ -1,0 +1,651 @@
+#!/usr/bin/env python3
+"""
+MenuMate — Full upgraded single-file program (WITH NEW FEATURES)
+New Features:
+1. Automatic, Rule-based Instructions per meal (Corrected Numbering).
+2. Enhanced AI Coach (calculates BMR/TDEE and compares plan).
+3. Specific 'Things to Avoid' lists based on weight goal.
+4. Clean List Output for Meal Plan.
+"""
+
+import os
+import uuid
+import logging
+import nest_asyncio
+import asyncio
+import json
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Any, Callable, Dict, List, Optional
+import random
+
+nest_asyncio.apply()
+
+# --------------------------
+# Configuration / ENV
+# --------------------------
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", None)
+_HAS_GEMINI = False
+genai = None
+
+try:
+    import google.generativeai as genai_lib
+    if GOOGLE_API_KEY:
+        genai_lib.configure(api_key=GOOGLE_API_KEY)
+        genai = genai_lib
+        _HAS_GEMINI = True
+except ImportError:
+    pass
+except Exception:
+    pass
+
+# --------------------------
+# Observability & metrics
+# --------------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("MenuMate")
+
+METRICS = {
+    "plans_generated": 0,
+    "agents_run": 0,
+    "gemini_calls": 0,
+    "sessions": 0,
+}
+
+# --------------------------
+# MiniMCP (Tool Registry)
+# --------------------------
+class MiniMCP:
+    def __init__(self):
+        self.tools: Dict[str, Callable[..., Any]] = {}
+    def register(self, name: str, func: Callable[..., Any]):
+        self.tools[name] = func
+        logger.info("MiniMCP: registered tool '%s'", name)
+    async def call(self, name: str, **kwargs):
+        if name not in self.tools:
+            raise RuntimeError(f"MiniMCP: tool '{name}' not registered")
+        tool = self.tools[name]
+        logger.debug(f"MCP Call: {name} with {kwargs.keys()}")
+        if asyncio.iscoroutinefunction(tool):
+            return await tool(**kwargs)
+        else:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(None, lambda: tool(**kwargs))
+
+MCP = MiniMCP()
+
+# --------------------------
+# Tools & Tool Logic
+# --------------------------
+
+# ### MODIFIED: THINGS TO AVOID LOGIC
+def mcp_nutrition_tool(age: int, weight: float, height: float, chronic_conditions: List[str], allergies: List[str], dietary_goal: str):
+    """Calculates BMI, safe food lists, and goal-specific avoidance lists."""
+    try:
+        bmi = weight / ((height / 100) ** 2)
+    except Exception:
+        bmi = 0.0
+
+    plan = "maintain"
+    g = (dietary_goal or "").lower()
+    if "muscle" in g: plan = "muscle_gain"
+    elif "loss" in g or "lose" in g or bmi >= 25: plan = "loss"
+    elif "gain" in g or bmi < 18.5: plan = "gain"
+
+    allowed = ["vegetables", "fruits", "dal", "oats", "brown rice", "quinoa", "lean protein", "paneer", "yogurt", "nuts", "eggs"]
+    avoid = ["sugar", "soft drinks", "deep fried foods", "excess salt"] # Base avoidance
+
+    # Goal-Specific Avoidance Logic
+    if plan == "loss":
+        avoid.extend(["refined carbohydrates (white bread/rice)", "high-calorie sauces", "excessive oil"])
+    elif plan == "gain" or plan == "muscle_gain":
+        avoid.extend(["high-fiber foods right before meals (to avoid fullness)", "skipping meals", "diet sodas"])
+
+    cc_lower = [c.lower() for c in (chronic_conditions or [])]
+    if "diabetes" in cc_lower:
+        avoid += ["high-sugar fruits", "refined flour / maida"]
+        allowed += ["low glycemic fruits (berries)", "millets"]
+    if "blood pressure" in cc_lower or "hypertension" in cc_lower:
+        avoid += ["excess salt", "pickles"]
+        allowed += ["potassium-rich foods (banana in moderation)"]
+
+    for a in (allergies or []):
+        a_low = a.lower().strip()
+        if a_low and a_low != "none":
+            allowed = [it for it in allowed if a_low not in it.lower()]
+            avoid.append(f"{a} (allergy)")
+
+    return {"bmi": round(bmi, 2), "plan": plan, "allowed": sorted(set(allowed)), "avoid": sorted(set(avoid))}
+
+MCP.register("nutrition_analysis", mcp_nutrition_tool)
+
+async def gemini_generate(prompt: str, max_output_tokens: int = 512) -> str:
+    """Wrapper for Google Gemini with Mock fallback."""
+    METRICS["gemini_calls"] += 1
+    
+    # MOCK MODE (if no API key or lib)
+    if not _HAS_GEMINI or not genai:
+        logger.warning("Gemini unavailable. Using Mock response.")
+        # FIX: Ensure mock output uses comma-separated ingredients
+        return (
+            "MOCK: Spicy Chickpea Salad | 15 | 12 | chickpeas, cucumber, chili | 300\n" 
+            "MOCK: Grilled Tofu Wrap | 20 | 18 | tofu, tortilla, lettuce | 450\n"
+            "MOCK: Berry Smoothie Bowl | 10 | 6 | frozen berries, yogurt, honey | 250"
+        )
+    # [REAL MODE REMAINS UNCHANGED] ...
+
+    loop = asyncio.get_event_loop()
+    def call_api():
+        try:
+            model = genai.GenerativeModel("gemini-1.5-flash")
+            resp = model.generate_content(prompt)
+            return resp.text
+        except Exception as e:
+            logger.error(f"Gemini API Error: {e}")
+            return "ERROR: Gemini call failed."
+            
+    return await loop.run_in_executor(None, call_api)
+
+MCP.register("gemini_generate", gemini_generate)
+
+# --------------------------
+# ### FIX: AUTOMATIC INSTRUCTIONS GENERATOR (Removed hardcoded numbering)
+# --------------------------
+def generate_instructions(recipe_name: str, cook_time: int, ingredients: List[str]) -> List[str]:
+    """Generates simple rule-based cooking instructions."""
+    # FIX: Removed '1.'
+    steps = [f"Preparation: Gather all ingredients ({', '.join(ingredients[:3])}) and chop/wash as needed."]
+    
+    if cook_time <= 15:
+        # FIX: Removed '2.'
+        steps.append(f"Quick Cook: Heat oil on high. Sauté ingredients quickly and mix for {cook_time} minutes.")
+    elif cook_time <= 30:
+        # FIX: Removed '2.' and '3.'
+        steps.append("Standard: Heat oil, sauté base veggies (onion/tomato). Add main ingredients and spices.")
+        steps.append("Simmer: Cook covered on low heat until done.")
+    else:
+        # FIX: Removed '2.' and '3.'
+        steps.append("Slow Cook: Marinate main protein/vegetable if required.")
+        steps.append("Process: Cook slowly or roast for required time.")
+        
+    # FIX: Removed '4.'
+    steps.append("Serving: Garnish and serve hot.")
+    return steps
+
+# --------------------------
+# PubSub, Session & Memory remain unchanged...
+# --------------------------
+
+class PubSub:
+    def __init__(self):
+        self.subs: Dict[str, List[Callable[[Dict[str, Any]], None]]] = {}
+    def subscribe(self, topic: str, callback: Callable[[Dict[str, Any]], None]):
+        self.subs.setdefault(topic, []).append(callback)
+    def publish(self, topic: str, message: Dict[str, Any]):
+        logger.debug(f"PubSub: Publishing to {topic}")
+        for cb in self.subs.get(topic, []):
+            try:
+                cb(message)
+            except Exception as e:
+                logger.error(f"PubSub callback error: {e}")
+
+pubsub = PubSub()
+
+class InMemorySessionService:
+    def __init__(self):
+        self.sessions: Dict[str, Dict[str, Any]] = {}
+        self.memory_bank: Dict[str, List[Dict[str, Any]]] = {}
+    def create_session(self, user_id: str) -> str:
+        sid = str(uuid.uuid4())
+        self.sessions[sid] = {
+            "user_id": user_id, 
+            "created_at": datetime.now(), 
+            "state": {"user_id": user_id}
+        }
+        METRICS["sessions"] += 1
+        return sid
+    def get_state(self, sid: str) -> Dict[str, Any]:
+        return self.sessions.get(sid, {}).get("state", {})
+    def update_state(self, sid: str, updates: Dict[str, Any]):
+        if sid in self.sessions:
+            self.sessions[sid]["state"].update(updates)
+    def store_memory(self, sid: str, memory_type: str, data: Dict[str, Any]):
+        key = f"{sid}_{memory_type}"
+        self.memory_bank.setdefault(key, []).append({
+            "timestamp": datetime.now().isoformat(),
+            "data": data
+        })
+    def context_compaction(self, sid: str, memory_type: str, max_items=3):
+        key = f"{sid}_{memory_type}"
+        if key in self.memory_bank and len(self.memory_bank[key]) > max_items:
+            logger.info(f"Compacting memory for {key}")
+            self.memory_bank[key] = self.memory_bank[key][-max_items:]
+
+session_service = InMemorySessionService()
+
+# --------------------------
+# Domain Logic (Recipes & Evaluation) remain unchanged...
+# --------------------------
+
+class RecipeTool:
+    def __init__(self):
+        self.recipes = {
+            "vegetarian": [
+                {"name": "Paneer Bhurji", "ingredients": ["paneer", "onion", "tomato"], "cook_time": 20, "protein": 18, "calories": 320},
+                {"name": "Vegetable Stir Fry", "ingredients": ["bell peppers", "broccoli", "carrots"], "cook_time": 20, "protein": 6, "calories": 200},
+                {"name": "Lentil Soup", "ingredients": ["lentils", "onion", "carrot"], "cook_time": 35, "protein": 14, "calories": 240},
+            ],
+            "nonveg": [
+                {"name": "Grilled Chicken Salad", "ingredients": ["chicken", "lettuce", "tomato"], "cook_time": 25, "protein": 30, "calories": 350},
+                {"name": "Fish Curry", "ingredients": ["fish", "tomato", "onion"], "cook_time": 30, "protein": 28, "calories": 320},
+            ],
+            "quick": [
+                {"name": "Avocado Toast", "ingredients": ["bread", "avocado", "lemon"], "cook_time": 10, "protein": 4, "calories": 260},
+                {"name": "Egg Omelette", "ingredients": ["eggs", "salt", "pepper"], "cook_time": 10, "protein": 12, "calories": 210},
+            ],
+            "indian": [
+                {"name": "Dal Tadka", "ingredients": ["dal", "onion", "tomato"], "cook_time": 35, "protein": 14, "calories": 300},
+                {"name": "Roti + Sabji", "ingredients": ["wheat flour", "vegetables"], "cook_time": 25, "protein": 6, "calories": 330},
+            ]
+        }
+    def search_recipes(self, categories: List[str], max_cook_time: int = 60) -> List[Dict[str, Any]]:
+        found = []
+        for cat in categories:
+            for r in self.recipes.get(cat, []):
+                if r.get("cook_time", 999) <= max_cook_time:
+                    found.append(r.copy())
+        return found
+
+recipe_tool = RecipeTool()
+
+class AgentEvaluator:
+    def evaluate_meal_plan(self, plan_result: Dict[str, Any]) -> Dict[str, Any]:
+        meal_plan = plan_result.get("meal_plan", [])
+        if not meal_plan:
+            return {"score": 0, "grade": "F", "explain": "No plan generated."}
+        
+        total_meals = sum(len(d['meals']) for d in meal_plan)
+        variety_score = len(set(m['recipe'] for d in meal_plan for m in d['meals'])) / max(1, total_meals)
+        
+        score = variety_score * 10
+        grade = "A" if score > 8 else "B" if score > 5 else "C"
+        
+        return {
+            "overall_score": round(score, 2), 
+            "grade": grade, 
+            "explain": f"Variety Index: {variety_score:.2f}"
+        }
+
+evaluator = AgentEvaluator()
+
+# --------------------------
+# Agent Framework remains unchanged...
+# --------------------------
+
+@dataclass
+class AgentContext:
+    session_id: str
+    trace_id: str
+    user_input: str
+    current_state: Dict[str, Any]
+
+class BaseAgent:
+    def __init__(self, name: str):
+        self.name = name
+        self.status = "idle"
+    async def process(self, context: AgentContext) -> Dict[str, Any]:
+        logger.info(f"[{context.trace_id}] Agent {self.name} START")
+        self.status = "processing"
+        METRICS["agents_run"] += 1
+        try:
+            res = await self._process_impl(context)
+            self.status = "completed"
+            logger.info(f"[{context.trace_id}] Agent {self.name} END")
+            return res
+        except Exception as e:
+            self.status = "error"
+            logger.error(f"[{context.trace_id}] Agent {self.name} FAILED: {e}")
+            return {"error": str(e)}
+    async def _process_impl(self, context: AgentContext) -> Dict[str, Any]:
+        raise NotImplementedError
+
+# --------------------------
+# Concrete Agents
+# --------------------------
+
+class PreferenceAgent(BaseAgent):
+    """Parses user input and gets nutritional constraints via MCP."""
+    async def _process_impl(self, context: AgentContext) -> Dict[str, Any]:
+        state = context.current_state
+        mcp_result = await MCP.call(
+            "nutrition_analysis",
+            age=state.get("age", 30),
+            weight=state.get("weight", 70),
+            height=state.get("height", 170),
+            chronic_conditions=state.get("health_conditions", []),
+            allergies=state.get("allergies", []),
+            dietary_goal=state.get("dietary_goal", "general")
+        )
+        
+        prefs = {
+            "dietary_goal": state.get("dietary_goal", "general"),
+            "veg_nonveg": state.get("veg_nonveg", "veg"),
+            "allergies": state.get("allergies", []),
+            "mcp_analysis": mcp_result
+        }
+        
+        session_service.update_state(context.session_id, {"preferences": prefs})
+        session_service.store_memory(context.session_id, "preferences", prefs)
+        
+        return {"preferences": prefs}
+
+class GeminiADKAgent(BaseAgent):
+    """Enhances the plan with creative suggestions via LLM."""
+    async def _process_impl(self, context: AgentContext) -> Dict[str, Any]:
+        prefs = context.current_state.get("preferences", {})
+        
+        # MODIFIED: Prompt now expects Calorie count for better planning
+        prompt = (
+            f"Suggest 3 unique healthy recipes for someone wanting to {prefs.get('dietary_goal')}. "
+            f"Diet: {prefs.get('veg_nonveg')}. "
+            f"Allergies: {prefs.get('allergies')}. "
+            "Format: Name | CookTime(mins) | Protein(g) | Ingredients(comma sep) | Calories(kcal)"
+        )
+        
+        raw_text = await MCP.call("gemini_generate", prompt=prompt)
+        
+        # Simple parsing logic
+        parsed_recipes = []
+        for line in raw_text.splitlines():
+            if "|" in line and "MOCK" not in line and "Name" not in line:
+                parts = [p.strip() for p in line.split("|")]
+                if len(parts) >= 5: # Expecting 5 parts now
+                    try:
+                        parsed_recipes.append({
+                            "name": parts[0],
+                            "cook_time": int(parts[1].split()[0]),
+                            "protein": int(parts[2].split()[0]),
+                            "ingredients": [i.strip() for i in parts[3].split(',')],
+                            "calories": int(parts[4].split()[0])
+                        })
+                    except ValueError:
+                        logger.warning(f"Could not parse Gemini line: {line}")
+
+        session_service.store_memory(context.session_id, "llm_raw_history", {"prompt": prompt, "resp": raw_text})
+        
+        return {"gemini_recipes": parsed_recipes}
+
+class RecipeAgent(BaseAgent):
+    """Selects deterministic recipes from local database."""
+    async def _process_impl(self, context: AgentContext) -> Dict[str, Any]:
+        prefs = context.current_state.get("preferences", {})
+        goal = prefs.get("dietary_goal", "").lower()
+        
+        categories = ["indian", "quick"]
+        if "gain" in goal: categories.append("nonveg")
+        if "veg" in prefs.get("veg_nonveg", ""): categories.append("vegetarian")
+        
+        found = recipe_tool.search_recipes(categories)
+        return {"db_recipes": found}
+
+class PlanningAgent(BaseAgent):
+    """
+    Aggregates recipes into a daily schedule and adds instructions.
+    """
+    async def _process_impl(self, context: AgentContext) -> Dict[str, Any]:
+        state = context.current_state
+        db_recipes = state.get("db_recipes", [])
+        gemini_recipes = state.get("gemini_recipes", [])
+        
+        all_recipes = db_recipes + gemini_recipes
+        if not all_recipes:
+            all_recipes = recipe_tool.search_recipes(["quick"])
+            
+        days = state.get("duration_days", 3)
+        plan = []
+        
+        for d in range(1, days + 1):
+            day_meals = []
+            for slot in ["Breakfast", "Lunch", "Dinner"]:
+                # Simple random selection for demo
+                r = random.choice(all_recipes)
+                
+                # ### AUTOMATIC INSTRUCTIONS INJECTION
+                instructions = generate_instructions(
+                    r["name"], 
+                    r.get("cook_time", 15), 
+                    r.get("ingredients", [])
+                )
+
+                day_meals.append({
+                    "slot": slot,
+                    "recipe": r["name"],
+                    "calories": r.get("calories", 300),
+                    "protein": r.get("protein", 10),
+                    "ingredients": r.get("ingredients", []),
+                    "cook_time": r.get("cook_time", 15),
+                    "instructions": instructions # <--- NEW FIELD
+                })
+            
+            day_total = sum(m["calories"] for m in day_meals)
+            plan.append({"day": d, "meals": day_meals, "total_calories": day_total})
+            
+        # Shopping List Generation
+        all_ingredients = set()
+        for day in plan:
+            for meal in day["meals"]:
+                if isinstance(meal["ingredients"], list):
+                    all_ingredients.update(meal["ingredients"])
+        
+        result = {"meal_plan": plan, "shopping_list": sorted(list(all_ingredients))}
+        
+        eval_result = evaluator.evaluate_meal_plan(result)
+        result["evaluation"] = eval_result
+        
+        return result
+
+class CoachAgent(BaseAgent):
+    """
+    ### MODIFIED: ENHANCED AI COACH 
+    Calculates BMR/TDEE and compares plan to target.
+    """
+    def calculate_bmr_tdee(self, age: int, weight: float, height: float, goal: str) -> Dict[str, float]:
+        """Calculates BMR and Target Calories (using Mifflin-St Jeor for simplicity)."""
+        # Assuming MALE for demo: BMR = (10 * W) + (6.25 * H) - (5 * A) + 5
+        bmr = (10 * weight) + (6.25 * height) - (5 * age) + 5
+        tdee = bmr * 1.55 # Moderate activity level multiplier
+
+        target = tdee
+        if "loss" in goal: target = tdee - 500
+        elif "gain" in goal or "muscle" in goal: target = tdee + 400
+        
+        return {"bmr": bmr, "tdee": tdee, "target": target}
+
+    async def _process_impl(self, context: AgentContext) -> Dict[str, Any]:
+        profile = context.current_state
+        plan_result = context.current_state.get("planning_result", {})
+        
+        age = profile.get("age", 30)
+        weight = profile.get("weight", 70)
+        height = profile.get("height", 170)
+        goal = profile.get("dietary_goal", "general")
+
+        cal_targets = self.calculate_bmr_tdee(age, weight, height, goal)
+        target_cal = cal_targets['target']
+        
+        meal_plan = plan_result.get("meal_plan", [])
+        avg_cal = sum(d["total_calories"] for d in meal_plan) / max(1, len(meal_plan))
+            
+        lines = []
+        lines.append(f"Coach Analysis: Your Maintenance TDEE is **~{int(cal_targets['tdee'])} kcal**.")
+        lines.append(f"Target for **{goal.upper()}** is **~{int(target_cal)} kcal/day**.")
+        lines.append(f"The plan averages **{int(avg_cal)} kcal/day**.")
+        
+        # Comparison logic
+        diff = avg_cal - target_cal
+        if diff > 200:
+            lines.insert(0, f"⚠️ WARNING: Plan is **{int(abs(diff))} kcal OVER** your target. Consider reducing portion size.")
+        elif diff < -200:
+            lines.insert(0, f"⚠️ WARNING: Plan is **{int(abs(diff))} kcal UNDER** your target. Consider adding a high-calorie snack.")
+        else:
+            lines.insert(0, "✅ STATUS: Plan alignment is excellent. Good job!")
+
+        # Tips remain unchanged...
+        tips = [
+            "Hydration: Drink at least 3L of water.",
+            "Sleep: 7-8 hours is crucial for metabolism."
+        ]
+        
+        conditions = profile.get("health_conditions") or []
+        conditions_lower = [c.lower() for c in conditions]
+        
+        if any("diabetes" in c for c in conditions_lower):
+            tips.insert(0, "Diabetes Care: Pair fruits with fats/protein to reduce glucose spikes.")
+        if "muscle" in goal:
+            tips.append("Timing: Eat protein within 30 mins post-workout.")
+
+        return {"coach_feedback": lines, "tips": tips, "calorie_data": cal_targets}
+
+
+# --------------------------
+# Orchestrator (Loop Agent) remains unchanged...
+# --------------------------
+
+class OrchestratorAgent:
+    def __init__(self):
+        self.pref_agent = PreferenceAgent("Preference")
+        self.recipe_agent = RecipeAgent("Recipe")
+        self.gemini_agent = GeminiADKAgent("Gemini")
+        self.planning_agent = PlanningAgent("Planner")
+        self.coach_agent = CoachAgent("Coach")
+
+    async def run_flow(self, user_input_data: Dict[str, Any]):
+        trace = uuid.uuid4().hex[:8]
+        sid = session_service.create_session(user_input_data["user_id"])
+        session_service.update_state(sid, user_input_data)
+        
+        def get_ctx():
+            return AgentContext(
+                session_id=sid,
+                trace_id=trace,
+                user_input="",
+                current_state=session_service.get_state(sid)
+            )
+
+        print(f"\n--- Starting MenuMate Flow (Trace: {trace}) ---")
+        
+        await self.pref_agent.process(get_ctx())
+        
+        ctx = get_ctx()
+        results = await asyncio.gather(
+            self.recipe_agent.process(ctx),
+            self.gemini_agent.process(ctx)
+        )
+        
+        session_service.update_state(sid, results[0])
+        session_service.update_state(sid, results[1])
+        
+        plan_res = await self.planning_agent.process(get_ctx())
+        session_service.update_state(sid, {"planning_result": plan_res})
+        
+        coach_res = await self.coach_agent.process(get_ctx())
+        session_service.update_state(sid, coach_res)
+        
+        session_service.context_compaction(sid, "llm_raw_history")
+        
+        return session_service.get_state(sid)
+
+# --------------------------
+# ### REMOVED: print_plan_table function (No longer used)
+# --------------------------
+
+# --------------------------
+# Main Execution / CLI (Final, Corrected Output)
+# --------------------------
+async def main():
+    print("Welcome to MenuMate Pro [Advanced AI Planner]")
+    print("---------------------------------------------")
+    
+    try:
+        # [ ... input gathering ... ]
+        
+        user_id = "user_001"
+        age = int(input("Age: ") or "30")
+        weight = float(input("Weight (kg): ") or "75")
+        height = float(input("Height (cm): ") or "175")
+        goal = input("Goal (weight_loss, muscle_gain, maintain): ") or "weight_loss"
+        cond_input = input("Health Conditions (comma sep, e.g., diabetes): ")
+        conditions = [c.strip() for c in cond_input.split(",")] if cond_input else []
+        days = int(input("Plan duration (1-7 days): ") or "3")
+        
+        input_data = {
+            "user_id": user_id,
+            "age": age,
+            "weight": weight,
+            "height": height, 
+            "dietary_goal": goal,
+            "health_conditions": conditions,
+            "allergies": [],
+            "veg_nonveg": "nonveg",
+            "duration_days": days
+        }
+        
+        orchestrator = OrchestratorAgent()
+        final_state = await orchestrator.run_flow(input_data)
+        
+        # Final Output Display
+        plan = final_state.get("planning_result", {})
+        coach = final_state.get("coach_feedback", [])
+        tips = final_state.get("tips", [])
+        eval_data = plan.get("evaluation", {})
+        prefs = final_state.get("preferences", {}).get("mcp_analysis", {})
+        
+        # 1. Meal Plan Display (Corrected Numbering Logic)
+        print("\n" + "="*40)
+        print(f"MEAL PLAN GENERATED (Grade: {eval_data.get('grade')})")
+        print("="*40)
+        
+        for day in plan.get("meal_plan", []):
+            print(f"\n📅 **Day {day['day']}** - Total: {day['total_calories']} kcal")
+            for m in day['meals']:
+                print(f"  > **{m['slot']}**: {m['recipe']} ({m['calories']} kcal, {m['cook_time']} mins)")
+                
+                # Print Instructions below the meal in a clear list
+                print("    Instructions:")
+                # The numbering now happens ONLY here, correctly sequencing the steps.
+                for i, instr in enumerate(m.get('instructions', []), 1):
+                     print(f"      {i}. {instr}")
+        
+        # 2. Coach's Corner (Point Form)
+        print("\n" + "="*40)
+        print("🧠 COACH'S CORNER (Automatic AI Analysis)")
+        print("="*40)
+        for line in coach:
+            print(f"• **{line}**")
+            
+        # 3. Things to Avoid (Point Form)
+        print("\n🚫 THINGS TO AVOID (Goal Focus)")
+        print("-" * 30)
+        for item in prefs.get("avoid", []):
+            print(f"  • **{item.capitalize()}**")
+
+        print("\n💡 Top Tips:")
+        for t in tips:
+            print(f"  • {t}")
+            
+        # 4. Shopping List
+        print("\n" + "-"*20)
+        print("🛒 SHOPPING LIST")
+        print("-"*20)
+        print(", ".join(plan.get("shopping_list", [])))
+            
+        print("\n(Observability: Metrics)")
+        print(json.dumps(METRICS, indent=2))
+
+    except KeyboardInterrupt:
+        print("\nGoodbye!")
+    except Exception as e:
+        logger.error(f"An unexpected error occurred in main: {e}")
+
+if __name__ == "__main__":
+    asyncio.run(main())
