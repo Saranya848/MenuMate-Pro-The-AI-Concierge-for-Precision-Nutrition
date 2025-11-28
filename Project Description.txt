@@ -1,0 +1,126 @@
+## 📄 MenuMate Pro: AI Concierge for Precision Nutrition
+
+This document outlines the **MenuMate Pro** project, a multi-agent system designed to automate and scientifically validate personalized meal planning. It is submitted under the **Concierge Agents** track.
+
+-----
+
+### Problem Statement 😫
+
+The core problem is the **Complexity, Risk, and Lack of Validation** in personalized dietary planning:
+
+1.  **Complexity and Time:** Creating a custom, multi-day meal plan that successfully balances **personal preferences, dietary goals (loss/gain), health conditions (e.g., diabetes), allergies**, and **nutritional science (BMR/TDEE)** is difficult and extremely time-consuming for the average person.
+2.  **Safety and Constraints:** Traditional online planners are often generic, lacking the mechanism to rigorously enforce safety constraints. Overlooking a chronic condition or allergy, or failing to warn a user about grossly misaligned caloric intake, introduces significant health risks.
+3.  **Lack of Validation:** Most automated recipe generators lack a "closed-loop" validation system. They can suggest creative meals, but they cannot scientifically audit the *entire plan* to confirm if it meets the specific **Target Caloric Intake** required for the user's goal. This means users are often following a plan that is statistically likely to fail their fitness objectives.
+
+This is an **important** problem because nutrition is fundamental to health, and poor planning leads to frustration, wasted effort, and potential health complications.
+
+-----
+
+### Why Agents? 🧠
+
+Agents are the ideal solution because the problem requires **specialization, parallelism, and structured validation**, tasks that a single Large Language Model (LLM) performs poorly:
+
+1.  **Specialization & Reliability:** The task requires both **creative ideation** (best handled by an LLM) and **deterministic calculation** (best handled by Python functions). MenuMate Pro splits these duties:
+      * The **CoachAgent** handles precise BMR/TDEE calculation—a math task where LLMs frequently hallucinate or approximate—guaranteeing numerical accuracy.
+      * The **PreferenceAgent** handles health constraint enforcement, a safety-critical, rule-based task.
+2.  **Parallelism for Speed:** Gathering recipe data from two different sources—a reliable local database and an external LLM API—can introduce significant latency. The **OrchestratorAgent** uses `asyncio.gather` to run the **RecipeAgent** and **GeminiADKAgent** concurrently, drastically cutting the total execution time.
+3.  **Structured Integration:** The **PlanningAgent** acts as an integration and assembly specialist. It merges disparate data (local recipes, LLM recipes, constraints) and applies further deterministic logic (like injecting the rule-based cooking instructions and compiling the final shopping list) to create a complex, structured deliverable, which is difficult to prompt an LLM to generate perfectly in one shot.
+
+-----
+
+### What You Created 🛠️
+
+MenuMate Pro is a robust, five-stage **multi-agent pipeline** orchestrated around a central state management system.
+
+#### Overall Architecture:
+
+The system flow is highly structured:
+
+1.  **Input:** User data (age, weight, goal, conditions) is ingested.
+2.  **Constraint Layer (Preference Agent):** Calls the `nutrition_analysis` tool to generate health-based constraints and the **Goal-Specific Avoidance List**.
+3.  **Sourcing Layer (Recipe Agent & GeminiADK Agent):** Runs in parallel. Sourcing is hybrid: local DB for reliability, Gemini LLM for creativity.
+4.  **Assembly Layer (Planning Agent):** Aggregates recipes, schedules the meals, and injects **rule-based, step-numbered cooking instructions**.
+5.  **Validation Layer (Coach Agent):** Performs the final, high-value check: deterministic calculation of the **Target Caloric Intake** and comparison against the plan's average calories.
+
+#### Key Components:
+
+  * **MiniMCP (Micro-Controller Plane):** A custom tool registry that provides a unified interface (`mcp.call()`) for agents to access both synchronous tools (nutrition math) and asynchronous APIs (Gemini).
+  * **GeminiADKAgent:** Utilizes **Gemini 1.5 Flash** for creative recipe generation, strictly using a pipe-separated output format to ensure data is parsable by the Planning Agent.
+  * **`mcp_nutrition_tool`:** A deterministic function that calculates BMI and generates dynamic safety lists (e.g., recommending avoiding high-calorie sauces for weight loss plans).
+  * **CoachAgent:** Implements the **Closed-Loop Validation**. It calculates BMR/TDEE and generates a clear, high-impact **WARNING** or **STATUS** message to the user if the plan is misaligned.
+
+-----
+
+### Demo 🚀
+
+*(As this is a written description, the demonstration is shown via the expected input/output)*
+
+**Input:**
+
+```
+Welcome to MenuMate Pro [Advanced AI Planner]
+Age: 35
+Weight (kg): 90
+Height (cm): 180
+Goal (weight_loss, muscle_gain, maintain): weight_loss
+Health Conditions (comma sep, e.g., diabetes): hypertension
+Plan duration (1-7 days): 3
+```
+
+**Partial Final Output (Focusing on Value Points):**
+
+```
+========================================
+🧠 COACH'S CORNER (Automatic AI Analysis)
+========================================
+• ⚠️ WARNING: Plan is **420 kcal OVER** your target. Consider reducing portion size.
+• Coach Analysis: Your Maintenance TDEE is **~2700 kcal**.
+• Target for **WEIGHT_LOSS** is **~2200 kcal/day**.
+• The plan averages **2620 kcal/day**.
+
+🚫 THINGS TO AVOID (Goal Focus)
+------------------------------
+ • Excessive oil
+ • Excess salt (hypertension)
+ • Deep fried foods
+ • High-calorie sauces
+ • Pickles (hypertension)
+ • Refined carbohydrates (white bread/rice)
+ 
+📅 **Day 1** - Total: 2650 kcal
+  > **Breakfast**: Paneer Bhurji (320 kcal, 20 mins)
+    Instructions:
+      1. Preparation: Gather all ingredients (paneer, onion, tomato) and chop/wash as needed.
+      2. Standard: Heat oil, sauté base veggies (onion/tomato). Add main ingredients and spices.
+      3. Simmer: Cook covered on low heat until done.
+      4. Serving: Garnish and serve hot.
+```
+
+The demo highlights the core value: the **Warning** from the CoachAgent is the first thing the user sees, followed by the specific plan and the goal- and condition-based **Avoidance List**.
+
+-----
+
+### The Build 🛠️
+
+  * **Programming Language:** Python 3.10+
+  * **Core Libraries:** `asyncio` (for concurrency), `dataclasses` (for context management), `logging`.
+  * **AI Integration:** `google-genai` using the **`gemini-1.5-flash`** model.
+  * **Architecture:** Custom **Orchestrator** and **MiniMCP** (Tool Registry).
+  * **Tools:** Standard Python functions (`mcp_nutrition_tool`, `generate_instructions`, BMR/TDEE calculation) are wrapped as tools to ensure separation of concerns.
+
+The project was created iteratively:
+
+1.  **Foundation:** Establishing the `MiniMCP` and `InMemorySessionService` to define the agent execution environment.
+2.  **Constraint First:** Building the `PreferenceAgent` and its dependency, the `mcp_nutrition_tool`, to ensure safety and goal-setting were the first priority.
+3.  **Parallel Sourcing:** Implementing the `RecipeAgent` and `GeminiADKAgent` simultaneously with `asyncio.gather` to optimize performance.
+4.  **Assembly:** Creating the `PlanningAgent` to unify the hybrid recipes and implementing the deterministic, rule-based **Instruction Generation**.
+5.  **Validation (The Coach):** Implementing the `CoachAgent` last, focusing exclusively on the mathematical validation logic to achieve the "closed-loop" check.
+
+-----
+
+### If I Had More Time, This is What I'd Do 🔮
+
+1.  **Advanced Constraint Solver:** Currently, recipe selection is simple random choice. I would implement a sophisticated constraint solver (e.g., using a linear programming library) in the **PlanningAgent** to guarantee that the final meal plan adheres to *all* macronutrient targets (Protein/Fat/Carbs) simultaneously, rather than just checking total calories.
+2.  **User Preference Learning:** Implement a memory feature where the PlanningAgent tracks meals the user liked or disliked (stored in the session memory) and uses that feedback to influence the recipe selection probability in future runs.
+3.  **Full Tool Integration:** Enhance the GeminiADKAgent to use a formal Google **Tool** (Function Calling) schema for `nutrition_analysis` rather than relying on internal state, further demonstrating advanced agent capabilities.
+4.  **External Deployment:** Integrate the system with a robust environment (like Google Cloud Functions or a dedicated Agent Engine deployment) and create a simple web frontend to allow non-CLI user interaction.
