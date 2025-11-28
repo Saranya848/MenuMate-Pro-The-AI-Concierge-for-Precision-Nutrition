@@ -1,6 +1,10 @@
 # MenuMate-Pro-The-AI-Concierge-for-Precision-Nutrition
 
+Title: MenuMate Pro: The AI Concierge for Precision Nutrition
+SubTitle: Multi-Agent System with Gemini-Augmentation and Closed-Loop Caloric Validation
+
 MenuMate Pro is a sophisticated, single-file Python application designed as a **Concierge Agent** to generate highly personalized, safe, and nutritionally validated meal plans using a multi-agent orchestration pattern and Google's Gemini LLM.
+
 
 ---
 
